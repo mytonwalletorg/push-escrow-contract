@@ -67,6 +67,7 @@ export type CheckInfo = {
   comment?: string;
   status: CheckStatus;
   createdAt: number;
+  senderAddress: Address;
 };
 
 export type PushEscrowConfig = {
@@ -311,6 +312,7 @@ export class PushEscrow implements Contract {
     const comment = result.stack.readCell().beginParse().loadStringTail() || undefined;
     const status = result.stack.readNumber() as CheckStatus;
     const createdAt = result.stack.readNumber();
+    const senderAddress = result.stack.readCell().beginParse().loadAddress();
 
     return {
       amount,
@@ -321,6 +323,7 @@ export class PushEscrow implements Contract {
       comment,
       status,
       createdAt,
+      senderAddress,
     };
   }
 }

@@ -19,7 +19,7 @@
 ;; Security:
 ;; - Checks are bound to specific Telegram chats via the `chat_instance` parameter or specific usernames via `username`.
 ;; - Requires cryptographic proof (signature) from Telegram to authorize payouts.
-;; - The signature includes both the `chat_instance`/`username` and a payload (first 72 bits of the receiver's address)
+;; - The signature includes both the `chat_instance`/`username` and a payload (first 72 bits of sha256 hash of the receiver's address)
 ;;   ensuring the signature is specific to both the chat/username and the receiving wallet.
 ;; - Prevents double-spending by immediately deleting the check from the contract's storage.
 ;;
@@ -98,7 +98,7 @@ const slice DEFAULT_COMMENT = "via @push";
 (int) string_to_int(slice str) inline {
   int result = 0;
   int sign_factor = 1;
-  
+
   ;; Check if the first character is a minus sign
   int first_char = str.preload_uint(8);
   if (first_char == 45) {  ;; ASCII code for '-'
@@ -127,9 +127,7 @@ const slice DEFAULT_COMMENT = "via @push";
   slice charset = get_b64_alphabet();
   slice binary_slice = binary_data.end_cell().begin_parse();
 
-  ;; Process all chunks in one loop without extra variables
-  while (binary_slice.slice_bits() >= 24) {
-    ;; Load 24 bits at once instead of 3 separate loads
+  repeat(binary_slice.slice_bits() / 24) {
     int combined = binary_slice~load_uint(24);
 
     encoded_result = encoded_result
@@ -142,9 +140,10 @@ const slice DEFAULT_COMMENT = "via @push";
   return encoded_result;
 }
 
-(slice) create_verification_message(slice auth_date, slice chat_instance_or_username, int with_username, slice receiver_address) inline {
-  (_, int receiver_address_hash) = receiver_address.parse_std_addr();
-  builder head = begin_cell().store_uint((receiver_address_hash >> (256 - HEAD_SIZE)), HEAD_SIZE);
+(slice) create_verification_message(int check_id, slice auth_date, slice chat_instance_or_username, int with_username, int receiver_address_hash) inline {
+  slice combined = begin_cell().store_uint(check_id, 32).store_uint(receiver_address_hash, 256).end_cell().begin_parse();
+  int receiver_address_hash_sha256 = string_hash(combined);
+  builder head = begin_cell().store_uint((receiver_address_hash_sha256 >> (256 - HEAD_SIZE)), HEAD_SIZE);
   builder head_base64 = encode_to_base64url(head);
 
   builder message = begin_cell()
@@ -186,7 +185,6 @@ const slice DEFAULT_COMMENT = "via @push";
 }
 
 (cell) create_jetton_transfer_message(slice jetton_wallet_address, int is_tiny_jetton, slice receiver_address, int jetton_amount, slice response_address, slice comment) inline {
-  ;; Create jetton transfer payload
   builder transfer_payload = begin_cell()
     .store_uint(op::jetton_transfer, 32)
     .store_uint(0, 64)  ;; query_id
@@ -225,7 +223,7 @@ const slice DEFAULT_COMMENT = "via @push";
 
 (slice, slice) load_jetton_wallets() inline {
   slice ds = get_data().begin_parse();
-  ds~load_msg_addr();  ;; Skip sudoer
+  ds~load_msg_addr();  ;; skip sudoer
   slice usdt_jetton_wallet = ds~load_msg_addr();
   slice my_jetton_wallet = ds~load_msg_addr();
   return (usdt_jetton_wallet, my_jetton_wallet);
@@ -267,18 +265,18 @@ const slice DEFAULT_COMMENT = "via @push";
 
 (slice, slice) load_wallet_addresses() inline {
   slice ds = get_data().begin_parse();
-  ds~load_msg_addr();  ;; Skip sudoer
+  ds~load_msg_addr();  ;; skip sudoer
   slice usdt_jetton_wallet = ds~load_msg_addr();
   slice my_jetton_wallet = ds~load_msg_addr();
-  
+
   return (usdt_jetton_wallet, my_jetton_wallet);
 }
 
 () save_acl(slice sudoer, slice usdt_jetton_wallet, slice my_jetton_wallet) impure inline {
   slice ds = get_data().begin_parse();
-  ds~load_msg_addr();  ;; Skip old sudoer
-  ds~load_msg_addr();  ;; Skip old usdt_jetton_wallet
-  ds~load_msg_addr();  ;; Skip old my_jetton_wallet
+  ds~load_msg_addr();  ;; skip old sudoer
+  ds~load_msg_addr();  ;; skip old usdt_jetton_wallet
+  ds~load_msg_addr();  ;; skip old my_jetton_wallet
   cell checks_dict = ds~load_dict();
 
   set_data(begin_cell()
@@ -291,9 +289,9 @@ const slice DEFAULT_COMMENT = "via @push";
 
 (int, slice) load_check(int check_id) inline {
   slice ds = get_data().begin_parse();
-  ds~load_msg_addr();  ;; Skip sudoer
-  ds~load_msg_addr();  ;; Skip usdt_jetton_wallet
-  ds~load_msg_addr();  ;; Skip my_jetton_wallet
+  ds~load_msg_addr();  ;; skip sudoer
+  ds~load_msg_addr();  ;; skip usdt_jetton_wallet
+  ds~load_msg_addr();  ;; skip my_jetton_wallet
   cell checks_dict = ds~load_dict();
   int exists = false;
   slice check_slice = null();
@@ -380,17 +378,19 @@ const slice DEFAULT_COMMENT = "via @push";
   int addr_type = receiver_address.preload_uint(2);
   throw_if(ERROR_INVALID_RECEIVER_ADDRESS, addr_type != 2);
 
+  (int workchain_id, int receiver_address_hash) = receiver_address.parse_std_addr();
+  throw_if(ERROR_INVALID_RECEIVER_ADDRESS, workchain_id != 0);
+
   slice chat_instance_or_username = chat_instance_or_username_cell.begin_parse();
   slice auth_date = auth_date_cell.begin_parse();
 
-  slice message = create_verification_message(auth_date, chat_instance_or_username, with_username, receiver_address);
+  slice message = create_verification_message(check_id, auth_date, chat_instance_or_username, with_username, receiver_address_hash);
   int is_valid = check_data_signature(message, signature, TELEGRAM_PUBKEY);
   throw_if(ERROR_INCORRECT_SIGNATURE, ~ is_valid);
 
   accept_message();
 
   int auth_date_int = string_to_int(auth_date);
-
   if (auth_date_int < created_at) {
     return ERROR_AUTH_DATE_TOO_OLD;
   }
@@ -434,7 +434,7 @@ const slice DEFAULT_COMMENT = "via @push";
       ;; Use stored comment if not empty, otherwise use default comment
       slice comment_slice = comment.begin_parse();
       slice final_comment = comment_slice.slice_bits() > 0 ? comment_slice : DEFAULT_COMMENT;
-      
+
       if (~ is_jetton) {
         cell msg = create_ton_transfer_message(receiver_address, amount, final_comment);
         send_raw_message(msg, SEND_MODE_PAY_FEES_SEPARATELY + SEND_MODE_IGNORE_ERRORS);
@@ -526,7 +526,7 @@ const slice DEFAULT_COMMENT = "via @push";
 
   if (op == op::jetton_transfer_notification) {
     (slice usdt_jetton_wallet, slice my_jetton_wallet) = load_wallet_addresses();
-    
+
     ;; Check if sender is one of the authorized jetton wallets
     int is_usdt_wallet = equal_slices_bits(sender_address, usdt_jetton_wallet);
     int is_my_wallet = equal_slices_bits(sender_address, my_jetton_wallet);
@@ -544,7 +544,7 @@ const slice DEFAULT_COMMENT = "via @push";
     throw_if(ERROR_INVALID_FORWARD_PAYLOAD, forward_payload.slice_bits() < 65);
 
     int forward_op = forward_payload~load_uint(32);
-    throw_if(ERROR_INVALID_FORWARD_OPERATION, forward_op != op::create_check);   
+    throw_if(ERROR_INVALID_FORWARD_OPERATION, forward_op != op::create_check);
 
     ;; Parse check creation parameters from forward payload
     int check_id = forward_payload~load_uint(32);
@@ -571,12 +571,12 @@ const slice DEFAULT_COMMENT = "via @push";
 
 ;; Get method to retrieve check information
 ;; @param check_id ID of the check to retrieve
-;; @returns (amount, jetton_wallet_address_cell, with_username, chat_instance, username_cell, comment_cell, status, created_at)
-(int, cell, int, int, cell, cell, int, int) get_check_info(int check_id) method_id {
+;; @returns (amount, jetton_wallet_address_cell, with_username, chat_instance, username_cell, comment_cell, status, created_at, sender_address)
+(int, cell, int, int, cell, cell, int, int, cell) get_check_info(int check_id) method_id {
   (int exists, slice check_slice) = load_check(check_id);
   throw_unless(ERROR_CHECK_NOT_FOUND, exists);
 
-  (int amount, _, cell jetton_wallet_address_cell, _, int with_username, int chat_instance, cell username, cell comment, int status, int created_at, _) = deserialize_check(check_slice);
+  (int amount, _, cell jetton_wallet_address_cell, _, int with_username, int chat_instance, cell username, cell comment, int status, int created_at, cell sender_address) = deserialize_check(check_slice);
 
-  return (amount, jetton_wallet_address_cell, with_username, chat_instance, username, comment, status, created_at);
+  return (amount, jetton_wallet_address_cell, with_username, chat_instance, username, comment, status, created_at, sender_address);
 }
