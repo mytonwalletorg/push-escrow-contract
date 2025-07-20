@@ -1,7 +1,8 @@
-/* eslint-disable class-methods-use-this */
-
 import type { Address, Cell, Contract, ContractProvider, Sender } from '@ton/core';
 import { beginCell, contractAddress, Dictionary, SendMode } from '@ton/core';
+
+const ID_SIZE = 20;
+export const CANCEL_FEE = 100000000n;
 
 export const Opcodes = {
   JETTON_TRANSFER: 0xf8a7ea5,
@@ -10,19 +11,19 @@ export const Opcodes = {
   SUDOER_REQUEST: 0x5e2a5f0a,
   CREATE_CHECK: 0x6a3f7c7f,
   CASH_CHECK: 0x69e7ac28,
+  CANCEL_CHECK: 0x4a1c5e3b,
 };
 
 export const Errors = {
   // op::set_jetton_wallets
-  JETTON_WALLETS_ALREADY_SET: 400,
-  UNAUTHORIZED_JETTON_WALLET: 401,
-  MISSING_FORWARD_PAYLOAD: 402,
-  INVALID_FORWARD_PAYLOAD: 403,
-  INVALID_FORWARD_OPERATION: 404,
+  UNAUTHORIZED_SUDOER: 400,
 
   // op::create_check error codes
   CHECK_ALREADY_EXISTS: 410,
   INSUFFICIENT_FUNDS: 411,
+  INVALID_PAYLOAD: 412,
+  INVALID_OP: 413,
+  MISSING_FORWARD_PAYLOAD: 414,
 
   // op::cash_check error codes
   CHECK_NOT_FOUND: 420,
@@ -31,15 +32,20 @@ export const Errors = {
   AUTH_DATE_TOO_OLD: 423,
   CHAT_INSTANCE_MISMATCH: 424,
   USERNAME_MISMATCH: 425,
-  UNAUTHORIZED_SENDER: 430,
+  UNAUTHORIZED_JETTON_WALLET: 426,
+
+  // op::cancel_check error codes
+  UNAUTHORIZED_CANCEL: 430,
+  INSUFFICIENT_CANCEL_FEE: 431,
 };
 
 export const Fees = {
-  TON_CREATE_GAS: 1000000n, // 0.001 TON
-  TON_CASH_GAS: 3000000n, // 0.003 TON
+  TON_CREATE_GAS: 6000000n, // 0.006 TON
+  TON_CASH_GAS: 8000000n, // 0.008 TON
   TON_TRANSFER: 3000000n, // 0.003 TON
-  JETTON_CREATE_GAS: 3000000n, // 0.003 TON
-  JETTON_CASH_GAS: 7000000n, // 0.007 TON
+  TON_CANCEL: 100000000n, // 0.1 TON
+  JETTON_CREATE_GAS: 7000000n, // 0.007 TON
+  JETTON_CASH_GAS: 9000000n, // 0.009 TON
   JETTON_TRANSFER: 50000000n, // 0.05 TON
   TINY_JETTON_TRANSFER: 18000000n, // 0.018 TON
 };
@@ -48,14 +54,11 @@ export function getAddressHash(address: Address): bigint {
   return BigInt(`0x${address.hash.toString('hex')}`);
 }
 
-export function createDefaultPushEscrowConfig(sudoer: Address): PushEscrowConfig {
+export function createDefaultPushEscrowConfig(instanceId: number, sudoer: Address): PushEscrowConfig {
   return {
+    instanceId,
     sudoer,
   };
-}
-
-export enum CheckStatus {
-  PENDING = 0,
 }
 
 export type CheckInfo = {
@@ -65,17 +68,18 @@ export type CheckInfo = {
   chatInstance?: string;
   username?: string;
   comment?: string;
-  status: CheckStatus;
   createdAt: number;
   senderAddress: Address;
 };
 
 export type PushEscrowConfig = {
+  instanceId: number;
   sudoer: Address;
 };
 
 export function pushEscrowConfigToCell(config: PushEscrowConfig): Cell {
   return beginCell()
+    .storeUint(config.instanceId, 32)
     .storeAddress(config.sudoer)
     // eslint-disable-next-line no-null/no-null
     .storeAddress(null) // usdt_jetton_wallet (initially null)
@@ -123,19 +127,12 @@ export class PushEscrow implements Contract {
   ) {
     const withUsername = opts.username !== undefined;
 
-    let cellBuilder = beginCell()
+    const cellBuilder = beginCell()
       .storeUint(Opcodes.CREATE_CHECK, 32)
-      .storeUint(opts.checkId, 32)
-      .storeBit(withUsername);
-
-    if (withUsername) {
-      cellBuilder = cellBuilder.storeStringRefTail(opts.username!);
-    } else {
-      cellBuilder = cellBuilder.storeInt(BigInt(opts.chatInstance!), 64);
-    }
-
-    // Add comment as a reference cell (empty string if not provided)
-    cellBuilder = cellBuilder.storeStringRefTail(opts.comment ?? '');
+      .storeUint(opts.checkId, ID_SIZE)
+      .storeBit(withUsername)
+      .storeStringRefTail(withUsername ? opts.username! : opts.chatInstance!)
+      .storeStringRefTail(opts.comment ?? '');
 
     return cellBuilder.endCell();
   }
@@ -203,7 +200,7 @@ export class PushEscrow implements Contract {
   ) {
     const messageBody = beginCell()
       .storeUint(Opcodes.CASH_CHECK, 32)
-      .storeUint(opts.checkId, 32)
+      .storeUint(opts.checkId, ID_SIZE)
       .storeStringRefTail(opts.authDate)
       .storeStringRefTail(opts.chatInstance || opts.username!)
       .storeAddress(opts.receiverAddress)
@@ -217,6 +214,28 @@ export class PushEscrow implements Contract {
       const errorMessage = `External message not accepted by smart contract\nExit code: ${exitCode}`;
       throw new Error(errorMessage);
     }
+  }
+
+  async sendCancelCheck(
+    provider: ContractProvider,
+    via: Sender,
+    opts: {
+      checkId: number;
+    },
+    overrideValue?: bigint,
+  ) {
+    await provider.internal(via, {
+      value: overrideValue ?? CANCEL_FEE,
+      sendMode: SendMode.PAY_GAS_SEPARATELY,
+      body: PushEscrow.prepareCancelCheck(opts),
+    });
+  }
+
+  static prepareCancelCheck(opts: { checkId: number }) {
+    return beginCell()
+      .storeUint(Opcodes.CANCEL_CHECK, 32)
+      .storeUint(opts.checkId, ID_SIZE)
+      .endCell();
   }
 
   async sendSetAcl(
@@ -307,10 +326,10 @@ export class PushEscrow implements Contract {
     }
 
     const withUsername = result.stack.readBoolean();
-    const chatInstance = result.stack.readBigNumberOpt()?.toString();
-    const username = result.stack.readCellOpt()?.beginParse().loadStringTail();
+    const chatOrUsername = result.stack.readCell().beginParse().loadStringTail();
+    const chatInstance = withUsername ? undefined : chatOrUsername;
+    const username = withUsername ? chatOrUsername : undefined;
     const comment = result.stack.readCell().beginParse().loadStringTail() || undefined;
-    const status = result.stack.readNumber() as CheckStatus;
     const createdAt = result.stack.readNumber();
     const senderAddress = result.stack.readCell().beginParse().loadAddress();
 
@@ -321,7 +340,6 @@ export class PushEscrow implements Contract {
       chatInstance,
       username,
       comment,
-      status,
       createdAt,
       senderAddress,
     };

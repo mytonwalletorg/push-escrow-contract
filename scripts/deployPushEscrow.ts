@@ -1,8 +1,11 @@
 import { Address, toNano } from '@ton/core';
-import { PushEscrow, createDefaultPushEscrowConfig } from '../wrappers/PushEscrow';
+import { createDefaultPushEscrowConfig, PushEscrow } from '../wrappers/PushEscrow';
 import { compile, NetworkProvider } from '@ton/blueprint';
 import { OpenedContract } from '@ton/core/dist/contract/openContract';
 import { JettonMaster } from '@ton/ton';
+
+const INSTANCE_ID = Number(process.env.INSTANCE_ID) || 1;
+console.log('Instance ID:', INSTANCE_ID);
 
 // Authorized jetton master addresses
 export const JETTON_MASTERS = {
@@ -16,10 +19,10 @@ export async function run(provider: NetworkProvider) {
   if (!sudoerAddress) {
     throw new Error('Deployer address is required');
   }
-  
+
   const pushEscrow = provider.open(
     PushEscrow.createFromConfig(
-      createDefaultPushEscrowConfig(sudoerAddress),
+      createDefaultPushEscrowConfig(INSTANCE_ID, sudoerAddress),
       await compile('PushEscrow'),
     ),
   );
